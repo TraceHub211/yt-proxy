@@ -4,7 +4,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || null;
 
-// Optional API key auth - set API_KEY env var on Railway to lock it down
+// Optional API key auth
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
   if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
@@ -14,7 +14,6 @@ app.use((req, res, next) => {
 });
 
 // GET /stream?v=VIDEO_ID
-// Pipes yt-dlp audio output directly to the response - no storage
 app.get('/stream', (req, res) => {
   const videoId = req.query.v;
   if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
@@ -27,21 +26,47 @@ app.get('/stream', (req, res) => {
     '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
     '--no-playlist',
     '--no-warnings',
+    '--buffer-size', '16K',
     '-o', '-',
     `https://www.youtube.com/watch?v=${videoId}`
   ]);
 
   let headersSent = false;
+  let clientGone = false;
+
+  req.on('close', () => {
+    clientGone = true;
+    try { ytdlp.kill(); } catch (e) {}
+  });
 
   ytdlp.stdout.once('data', () => {
-    if (!headersSent) {
+    if (!headersSent && !res.headersSent) {
       headersSent = true;
       res.setHeader('Content-Type', 'audio/webm');
       res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('Keep-Alive', 'timeout=600');
     }
   });
 
-  ytdlp.stdout.pipe(res);
+  ytdlp.stdout.on('data', (chunk) => {
+    if (clientGone || res.destroyed) return;
+    if (!headersSent && !res.headersSent) {
+      headersSent = true;
+      res.setHeader('Content-Type', 'audio/webm');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+    }
+    try { res.write(chunk); } catch (e) {}
+  });
+
+  ytdlp.stdout.on('end', () => {
+    if (!clientGone && !res.destroyed) {
+      try { res.end(); } catch (e) {}
+    }
+  });
 
   ytdlp.stderr.on('data', d => {
     const msg = d.toString().trim();
@@ -49,19 +74,18 @@ app.get('/stream', (req, res) => {
   });
 
   ytdlp.on('close', (code) => {
-    if (code !== 0 && !headersSent) {
-      res.status(500).json({ error: 'yt-dlp failed', code });
+    if (code !== 0 && !headersSent && !res.headersSent) {
+      try { res.status(500).json({ error: 'yt-dlp failed', code }); } catch (e) {}
+    } else if (!clientGone && !res.destroyed) {
+      try { res.end(); } catch (e) {}
     }
   });
 
   ytdlp.on('error', (err) => {
     console.error('[yt-dlp spawn error]', err.message);
-    if (!headersSent) res.status(500).json({ error: err.message });
-  });
-
-  // Client disconnected - kill yt-dlp immediately (no wasted bandwidth)
-  req.on('close', () => {
-    try { ytdlp.kill(); } catch (e) {}
+    if (!headersSent && !res.headersSent) {
+      try { res.status(500).json({ error: err.message }); } catch (e) {}
+    }
   });
 });
 
